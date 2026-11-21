@@ -11,9 +11,9 @@
     <a class="button ghost" href="{{ url_for('export_run', run_id=run.id) }}">导出 CSV</a>
   </div>
   {% if not is_current %}
-    <p class="banner info">这是旧快照，只读展示；当前生效统计见
-      {% if active_run_id %}<a href="{{ url_for('run_detail', run_id=active_run_id) }}">快照 #{{ active_run_id }}</a>{% else %}<a href="{{ url_for('index') }}">总览</a>{% endif %}。
-      核对结论保存后将以最新统计为准。</p>
+    <p class="banner info">这是旧快照，只读展示：待核题格与核对结论均为生成该快照时的记录，不能在此提交或修改。
+      要提交核对结论，请前往
+      {% if active_run_id %}<a href="{{ url_for('run_detail', run_id=active_run_id) }}">当前生效快照 #{{ active_run_id }}</a>{% else %}<a href="{{ url_for('index') }}">总览</a>{% endif %}。</p>
   {% endif %}
   {% include "_stats_table.html" %}
 </section>
@@ -31,20 +31,36 @@
           <td class="code">{{ c.std_code }}</td>
           <td class="muted">{{ c.detail }}</td>
           <td class="review-cell">
-            <form method="post" action="{{ url_for('review') }}" class="review-form">
-              <input type="hidden" name="card_no" value="{{ c.card_no }}">
-              <input type="hidden" name="std_code" value="{{ c.std_code }}">
-              <select name="resolution">
-                <option value="blank" {% if d and d.resolution == 'blank' %}selected{% endif %}>计漏答</option>
-                <option value="skip" {% if d and d.resolution == 'skip' %}selected{% endif %}>跳过不计</option>
-                {% for opt in run.stats[c.std_code].options.keys() %}
-                  <option value="opt:{{ opt }}" {% if d and d.resolution == 'opt:' + opt %}selected{% endif %}>判为 {{ opt }}</option>
-                {% endfor %}
-              </select>
-              <input type="text" name="note" placeholder="备注" value="{{ d.note if d else '' }}">
-              <button type="submit">保存结论</button>
-            </form>
-            {% if d %}<span class="muted small">当前：{{ d.resolution }}{% if d.note %} · {{ d.note }}{% endif %}</span>{% endif %}
+            {% if is_current %}
+              <form method="post" action="{{ url_for('review') }}" class="review-form">
+                <input type="hidden" name="run_id" value="{{ run.id }}">
+                <input type="hidden" name="card_no" value="{{ c.card_no }}">
+                <input type="hidden" name="std_code" value="{{ c.std_code }}">
+                <select name="resolution">
+                  <option value="blank" {% if d and d.resolution == 'blank' %}selected{% endif %}>计漏答</option>
+                  <option value="skip" {% if d and d.resolution == 'skip' %}selected{% endif %}>跳过不计</option>
+                  {% for opt in run.stats[c.std_code].options.keys() %}
+                    <option value="opt:{{ opt }}" {% if d and d.resolution == 'opt:' + opt %}selected{% endif %}>判为 {{ opt }}</option>
+                  {% endfor %}
+                </select>
+                <input type="text" name="note" placeholder="备注" value="{{ d.note if d else '' }}">
+                <button type="submit">保存结论</button>
+              </form>
+              {% if d %}<span class="muted small">当前：{{ d.resolution }}{% if d.note %} · {{ d.note }}{% endif %}</span>{% endif %}
+            {% else %}
+              {% if d %}
+                <span class="tag">生成时结论：
+                  {%- if d.resolution == 'blank' %}计漏答
+                  {%- elif d.resolution == 'skip' %}跳过不计
+                  {%- elif d.resolution.startswith('opt:') %}判为 {{ d.resolution[4:] }}
+                  {%- else %}{{ d.resolution }}{% endif -%}
+                </span>
+                {% if d.note %}<span class="muted small">{{ d.note }}</span>{% endif %}
+                <span class="muted small">{{ d.decided_at }}</span>
+              {% else %}
+                <span class="muted small">生成时无核对结论</span>
+              {% endif %}
+            {% endif %}
           </td>
         </tr>
       {% endfor %}

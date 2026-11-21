@@ -491,6 +491,158 @@ def read_run_by_id(app, run_id):
             conn.close()
 
 
+# --------------------------------------------------------------------------
+# Snapshot-scoped review conclusions
+# --------------------------------------------------------------------------
+
+DIVERGENT_FORM_B = form_csv([
+    ("1", "A", "Q1", "B"), ("1", "B", "Q1", "A"),
+    ("2", "A", "Q2", "B"), ("2", "B", "Q2", "A"),
+])
+
+
+def flagged_setup(client):
+    """Two forms disagreeing on both questions -> C1 flagged on Q1 and Q2."""
+    upload(client, "/forms", A_FORM, name="A卷")
+    upload(client, "/forms", DIVERGENT_FORM_B, name="B卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", ""), ("C1", "2", "A", ""),
+    ]))
+
+
+def test_snapshot_freezes_generation_time_decisions(client, app):
+    flagged_setup(client)
+    client.post("/review", data={
+        "card_no": "C1", "std_code": "Q1", "resolution": "opt:A", "note": "第一版",
+    }, follow_redirects=True)
+    frozen = current_run(app)["id"]
+    client.post("/review", data={
+        "card_no": "C1", "std_code": "Q1", "resolution": "skip", "note": "改判",
+    }, follow_redirects=True)
+    later = current_run(app)["id"]
+    assert frozen != later
+
+    old = read_run_by_id(app, frozen)
+    assert old["decisions"][("C1", "Q1")]["resolution"] == "opt:A"
+    assert old["decisions"][("C1", "Q1")]["note"] == "第一版"
+    new = read_run_by_id(app, later)
+    assert new["decisions"][("C1", "Q1")]["resolution"] == "skip"
+    assert new["decisions"][("C1", "Q1")]["note"] == "改判"
+
+
+def test_historical_page_is_read_only_current_page_is_writable(client, app):
+    flagged_setup(client)
+    first = current_run(app)["id"]
+    page = client.get(f"/runs/{first}").get_data(as_text=True)
+    assert 'action="/review"' in page  # current snapshot offers the form
+
+    client.post("/review", data={
+        "card_no": "C1", "std_code": "Q1", "resolution": "blank",
+    }, follow_redirects=True)
+    second = current_run(app)["id"]
+    assert second != first
+
+    old_page = client.get(f"/runs/{first}").get_data(as_text=True)
+    assert "历史只读" in old_page
+    assert 'action="/review"' not in old_page      # no write path on history
+    assert "生成时无核对结论" in old_page            # frozen-at-generation view
+    # Q2 is still flagged in the new current snapshot: writable there.
+    new_page = client.get(f"/runs/{second}").get_data(as_text=True)
+    assert 'action="/review"' in new_page
+
+
+def test_review_post_with_stale_run_id_is_rejected(client, app):
+    flagged_setup(client)
+    first = current_run(app)["id"]
+    client.post("/review", data={
+        "card_no": "C1", "std_code": "Q1", "resolution": "blank",
+        "run_id": str(first),
+    }, follow_redirects=True)
+    second = current_run(app)["id"]
+    assert second != first
+
+    # A page still showing the now-historical snapshot must not write.
+    resp = client.post("/review", data={
+        "card_no": "C1", "std_code": "Q2", "resolution": "blank",
+        "run_id": str(first),
+    }, follow_redirects=True)
+    assert "只读" in resp.get_data(as_text=True)
+    assert current_run(app)["id"] == second        # no new snapshot
+    assert ("C1", "Q2") not in current_run(app)["decisions"]
+    with app.app_context():
+        conn = db.connect(app.config["DB_PATH"])
+        live = conn.execute(
+            "SELECT COUNT(*) AS n FROM review_decisions WHERE std_code = 'Q2'"
+        ).fetchone()["n"]
+        conn.close()
+    assert live == 0
+
+
+def test_review_redirects_to_current_run_page(client, app):
+    flagged_setup(client)
+    resp = client.post("/review", data={
+        "card_no": "C1", "std_code": "Q1", "resolution": "blank",
+    }, follow_redirects=False)
+    assert resp.status_code == 303
+    assert resp.headers["Location"].startswith("/runs/current")
+    page = client.get("/runs/current").get_data(as_text=True)
+    assert "当前生效" in page
+    assert 'action="/review"' in page
+
+
+def test_old_snapshot_keeps_own_decisions_after_form_replacement(client, app):
+    flagged_setup(client)
+    client.post("/review", data={
+        "card_no": "C1", "std_code": "Q1", "resolution": "opt:A", "note": "快照内结论",
+    }, follow_redirects=True)
+    frozen = current_run(app)["id"]
+
+    # Replace B卷 with a copy of A卷: everything becomes consistent, the live
+    # conclusion stops applying — but the old snapshot must not change.
+    upload(client, "/forms", A_FORM, name="B卷")
+    run = current_run(app)
+    assert run["id"] != frozen
+    assert stats_of(run)["Q1"]["counted"] == 1
+
+    old = read_run_by_id(app, frozen)
+    assert old["decisions"][("C1", "Q1")]["resolution"] == "opt:A"
+    assert old["decisions"][("C1", "Q1")]["note"] == "快照内结论"
+    assert stats_of(old)["Q1"]["options"]["A"] == 1
+    resp = client.get(f"/runs/{frozen}")
+    assert resp.status_code == 200
+    assert 'action="/review"' not in resp.get_data(as_text=True)
+
+
+def test_init_db_backfills_active_run_decisions(app):
+    client = app.test_client()
+    flagged_setup(client)
+    client.post("/review", data={
+        "card_no": "C1", "std_code": "Q1", "resolution": "opt:A", "note": "升级前",
+    }, follow_redirects=True)
+    run_id = current_run(app)["id"]
+
+    # Simulate upgrading a database created before per-snapshot decisions.
+    with app.app_context():
+        conn = db.connect(app.config["DB_PATH"])
+        conn.execute("DELETE FROM run_review_decisions")
+        conn.close()
+    assert read_run_by_id(app, run_id)["decisions"] == {}
+
+    db.init_db(app.config["DB_PATH"])
+    restored = read_run_by_id(app, run_id)["decisions"]
+    assert restored[("C1", "Q1")]["resolution"] == "opt:A"
+    assert restored[("C1", "Q1")]["note"] == "升级前"
+
+
+def test_invalid_review_resolution_keeps_state(client, app):
+    flagged_setup(client)
+    before = current_run(app)["id"]
+    client.post("/review", data={
+        "card_no": "C1", "std_code": "Q1", "resolution": "bogus",
+    }, follow_redirects=True)
+    assert current_run(app)["id"] == before
+
+
 def test_queued_job_replayed_after_restart(app):
     # Simulate a job accepted just before a crash: persisted 'queued', never run.
     with app.app_context():

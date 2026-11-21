@@ -90,6 +90,19 @@ CREATE TABLE IF NOT EXISTS run_unmatched (
     PRIMARY KEY (run_id, card_no)
 );
 
+-- Review conclusions frozen into each snapshot at generation time, so a
+-- historical run keeps showing the conclusions that were in effect when it
+-- was computed instead of whatever the live review_decisions table holds now.
+CREATE TABLE IF NOT EXISTS run_review_decisions (
+    run_id     INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    card_no    TEXT NOT NULL,
+    std_code   TEXT NOT NULL,
+    resolution TEXT NOT NULL,          -- opt:<value> | blank | skip
+    note       TEXT NOT NULL DEFAULT '',
+    decided_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, card_no, std_code)
+);
+
 CREATE TABLE IF NOT EXISTS jobs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     kind        TEXT NOT NULL,
@@ -140,6 +153,23 @@ def init_db(db_path: str) -> None:
             "UPDATE jobs SET status = 'queued', started_at = NULL "
             "WHERE status = 'running'"
         )
+        # Migration for databases created before run_review_decisions existed:
+        # old snapshots have no recorded conclusions.  For the active run the
+        # live table holds exactly the conclusions in effect, so backfill it
+        # once; older runs stay empty (their generation-time conclusions are
+        # unknowable) and are read-only anyway.
+        active = active_run_id(conn)
+        if active:
+            conn.execute(
+                "INSERT INTO run_review_decisions"
+                "(run_id, card_no, std_code, resolution, note, decided_at) "
+                "SELECT ?, card_no, std_code, resolution, note, decided_at "
+                "FROM review_decisions "
+                "WHERE NOT EXISTS ("
+                "  SELECT 1 FROM run_review_decisions WHERE run_id = ?"
+                ")",
+                (active, active),
+            )
     finally:
         conn.close()
 

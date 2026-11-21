@@ -408,6 +408,16 @@ def persist_run(conn, analysis: Analysis, created_at: str) -> int:
         "INSERT INTO run_unmatched(run_id, card_no, detail) VALUES (?, ?, ?)",
         [(run_id, u["card_no"], u["detail"]) for u in analysis.unmatched_cards],
     )
+    # Freeze the human review conclusions in effect at generation time.  The
+    # snapshot must keep showing its own conclusions even after later
+    # mutations change the live review_decisions table.
+    conn.execute(
+        "INSERT INTO run_review_decisions"
+        "(run_id, card_no, std_code, resolution, note, decided_at) "
+        "SELECT ?, card_no, std_code, resolution, note, decided_at "
+        "FROM review_decisions",
+        (run_id,),
+    )
     return run_id
 
 

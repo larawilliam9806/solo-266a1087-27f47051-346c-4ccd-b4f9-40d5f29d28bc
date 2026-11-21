@@ -7,6 +7,11 @@ Design notes
   persist new snapshot -> flip active_run_id`` inside one SQLite transaction.
   Either all of it commits or none of it does, so a failed save leaves the
   previous forms, codes, conclusions and statistics untouched.
+* Each snapshot freezes the review conclusions in effect at generation time
+  (``run_review_decisions``).  Historical snapshots are strictly read-only:
+  they render their own frozen conclusions and no submission form; only the
+  current snapshot accepts conclusions (enforced via a hidden ``run_id``
+  checked against ``active_run_id``).
 * Jobs are processed by one background worker, FIFO.  While it runs, the
   previous snapshot remains the active one and stays fully readable
   ("重算期间可查原统计").
@@ -376,10 +381,8 @@ def read_run(conn, run_id: int) -> dict | None:
         "decisions": {
             (r["card_no"], r["std_code"]): dict(r)
             for r in conn.execute(
-                "SELECT * FROM review_decisions WHERE card_no IN "
-                "(SELECT card_no FROM run_card_results WHERE run_id = ?) "
-                "AND std_code IN (SELECT std_code FROM run_question_stats WHERE run_id = ?)",
-                (run_id, run_id),
+                "SELECT * FROM run_review_decisions WHERE run_id = ?",
+                (run_id,),
             )
         },
     }
@@ -448,12 +451,10 @@ def register_routes(app: Flask):
             error=request.args.get("error"), message=request.args.get("message"),
         )
 
-    @app.get("/runs/<int:run_id>")
-    def run_detail(run_id: int):
-        conn = get_db()
+    def _render_run(conn, run_id: int):
         view = read_run(conn, run_id)
         if view is None:
-            return render_template("missing.html"), 404
+            return None
         current = active_run_id(conn)
         review_card = request.args.get("card", "").strip()
         review_code = request.args.get("code", "").strip()
@@ -472,6 +473,38 @@ def register_routes(app: Flask):
             review_code=review_code, review_rows=review_rows,
             error=request.args.get("error"), message=request.args.get("message"),
         )
+
+    @app.get("/runs/<int:run_id>")
+    def run_detail(run_id: int):
+        conn = get_db()
+        page = _render_run(conn, run_id)
+        if page is None:
+            return render_template("missing.html"), 404
+        return page
+
+    @app.get("/runs/current")
+    def run_current():
+        """Render whatever snapshot is currently active.
+
+        Review submissions land here so that once the triggered recompute
+        commits, the page's auto-refresh reloads into the *new* active
+        snapshot instead of a now-historical /runs/<id> URL.
+        """
+        conn = get_db()
+        current = active_run_id(conn)
+        if current:
+            page = _render_run(conn, current)
+            if page is not None:
+                return page
+        params = []
+        for key in ("error", "message"):
+            value = request.args.get(key)
+            if value:
+                params.append(f"{key}={quote(value, safe='')}")
+        target = url_for("index")
+        if params:
+            target += "?" + "&".join(params)
+        return redirect(target, code=303)
 
     @app.get("/cards")
     def cards():
@@ -536,15 +569,30 @@ def register_routes(app: Flask):
         code = (request.form.get("std_code") or "").strip()
         resolution = (request.form.get("resolution") or "").strip()
         note = (request.form.get("note") or "").strip()
+        run_id_raw = (request.form.get("run_id") or "").strip()
         if not card_no or not code:
-            return _back("卡号和标准题码不能为空")
+            return _review_back("卡号和标准题码不能为空")
         if resolution not in ("skip", "blank") and not resolution.startswith("opt:"):
-            return _back("无效的核对结论")
+            return _review_back("无效的核对结论")
+        # Conclusions may only be submitted against the current snapshot.
+        # Historical pages render no form at all; a mismatched run_id means
+        # the page was opened before a recompute flipped the active snapshot,
+        # so the conclusion would be based on stale statistics.  Reject it
+        # and leave every conclusion and statistic untouched.
+        if run_id_raw:
+            try:
+                posted_run = int(run_id_raw)
+            except ValueError:
+                return _review_back("无效的快照编号")
+            if posted_run != active_run_id(get_db()):
+                return _review_back(
+                    "该快照已成为历史只读版本，核对结论只能在当前生效快照上提交"
+                )
         app.worker.submit("set_decision", {
             "card_no": card_no, "std_code": code,
             "resolution": resolution, "note": note,
         })
-        return _back(None, f"卡号 {card_no} / 题码 {code} 的核对结论已受理")
+        return _review_back(None, f"卡号 {card_no} / 题码 {code} 的核对结论已受理")
 
     @app.get("/api/status")
     def api_status():
@@ -589,6 +637,19 @@ def _back(error: str | None = None, message: str | None = None):
         params.append("message=" + quote(message, safe=""))
     if params:
         target += ("&" if "?" in target else "?") + "&".join(params)
+    return redirect(target, code=303)
+
+
+def _review_back(error: str | None = None, message: str | None = None):
+    """Send the user to the always-current snapshot page after a review post."""
+    params = []
+    if error:
+        params.append("error=" + quote(error, safe=""))
+    if message:
+        params.append("message=" + quote(message, safe=""))
+    target = url_for("run_current")
+    if params:
+        target += "?" + "&".join(params)
     return redirect(target, code=303)
 
 
